@@ -7,6 +7,7 @@ import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RedisData;
 import com.hmdp.utils.SystemConstants;
@@ -30,24 +31,18 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Resource
     StringRedisTemplate stringRedisTemplate;
 
+    @Resource
+    CacheClient cacheClient;
+
     @Override
     public Result queryById(Long id) {
 
-        String key = RedisConstants.CACHE_SHOP_KEY + id;
+        Shop shop = cacheClient.queryWithLogicExpire(
+                RedisConstants.CACHE_SHOP_KEY, id, Shop.class, this::getById, RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
 
-        String shopJson = stringRedisTemplate.opsForValue().get(key);
-
-        if (StrUtil.isNotBlank(shopJson)){
-            Shop shop = JSONUtil.toBean(shopJson, Shop.class);
-            return Result.ok(shop);
-        }
-
-        Shop shop = getById(id);
         if (shop == null){
             return Result.fail("店铺不存在");
         }
-
-        stringRedisTemplate.opsForValue().set(key,JSONUtil.toJsonStr(shop),30L, TimeUnit.MINUTES);
         return Result.ok(shop);
     }
 
