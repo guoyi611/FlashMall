@@ -1,5 +1,6 @@
 package com.hmdp.service.impl;
 
+import com.hmdp.config.RedissonConfig;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.Voucher;
@@ -12,6 +13,8 @@ import com.hmdp.service.IVoucherService;
 import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -39,8 +42,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     RedisIdWorker redisIdWorker;
     @Resource
     StringRedisTemplate stringRedisTemplate;
+    @Resource
+    RedissonClient redissonClient;
 
-    @Transactional
     @Override
     public Result seckillVoucher(Long voucherId) {
         // 1.查询优惠券
@@ -66,8 +70,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         UserDTO user = UserHolder.getUser();
         Long userId = user.getId();
 
-        SimpleRedisLock simpleRedisLock = new SimpleRedisLock(stringRedisTemplate,"order:" + userId);
-        boolean isLock = simpleRedisLock.tryLock(600L);
+        RLock lock = redissonClient.getLock("lock:order:" + userId);
+        boolean isLock = lock.tryLock();
         if (!isLock){
             return Result.fail("不要重复下单");
         }
@@ -78,12 +82,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         } catch (IllegalStateException e) {
             throw new RuntimeException(e);
         } finally {
-            simpleRedisLock.unLock();
+            lock.unlock();
         }
     }
 
     @Transactional
-    @Override
     public Result createVoucherOrder(Long voucherId) {
         // 5.一人一单逻辑
         // 5.1.用户id
