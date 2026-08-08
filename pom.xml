@@ -29,6 +29,11 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
+        <!--AOP,提供 @EnableAspectJAutoProxy 所需的 aspectjweaver-->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>mysql</groupId>

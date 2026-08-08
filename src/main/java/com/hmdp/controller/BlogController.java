@@ -34,6 +34,10 @@ public class BlogController {
 
     @PostMapping
     public Result saveBlog(@RequestBody Blog blog) {
+        Long shopId = blog.getShopId();
+        if (shopId == null){
+            return Result.fail("请选择店铺");
+        }
         // 获取登录用户
         UserDTO user = UserHolder.getUser();
         blog.setUserId(user.getId());
