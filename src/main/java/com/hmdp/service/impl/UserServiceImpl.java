@@ -97,6 +97,8 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         return Result.ok(token);
     }
 
+
+
     private User createUserWithPhone(String phone) {
         // 快捷生成用户
         User user = new User();
@@ -108,5 +110,12 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         save(user);
         // 返回用户
         return user;
+    }
+
+    @Override
+    public Result logout(String token) {
+        String tokenKey = LOGIN_USER_KEY + token;
+        stringRedisTemplate.delete(tokenKey);
+        return Result.ok();
     }
 }
