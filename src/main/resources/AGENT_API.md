@@ -101,10 +101,10 @@
 
 ---
 
-## 三、AI 管家接口(后端需新增)
+## 三、AI 管家接口
 
 > 核心:多 Agent 协作。用户发一条消息,后端编排多个 Agent(意图识别→搜索→分析→推荐→汇总),**实时推送各 Agent 状态**,最终返回结果。
-> 推荐使用 **SSE 流式**方案,前端能实时看到 Agent 协作过程(与现有 [agent.html](html/hmdp/agent.html) 的 mock 效果一致)。
+> 推荐使用 **SSE 流式**方案,前端能实时看到 Agent 协作过程
 
 ### 方案一(推荐):SSE 流式聊天
 
@@ -221,36 +221,6 @@ chat('帮我推荐周末聚餐的餐厅', {
   onDone: () => { this.agentsRunning = false; }
 });
 ```
-
-### 方案二(备选):异步任务 + 轮询
-
-后端不想做 SSE 时使用,前端通过轮询获取进度。
-
-#### 1. `POST /api/agent/task` — 提交任务
-
-**请求体**: `{"message":"...", "sessionId":"可选"}`
-
-**响应 data**:
-```json
-{ "taskId": "t_1001", "sessionId": "s_1001" }
-```
-
-#### 2. `GET /api/agent/task/{taskId}` — 查询任务状态
-
-**响应 data**:
-```json
-{
-  "status": "RUNNING",        // RUNNING | SUCCESS | FAILED
-  "agents": [
-    { "agentId": 1, "name": "意图识别Agent", "status": "done", "duration": 612, "description": "..." },
-    { "agentId": 2, "name": "搜索Agent", "status": "running", "duration": 0, "description": "..." }
-  ],
-  "result": "最终回复(markdown),status=SUCCESS 时才有",
-  "errorMsg": "失败原因,status=FAILED 时才有"
-}
-```
-
-**前端轮询逻辑**:提交后每 800ms 调用一次 `GET /api/agent/task/{taskId}`,用 `agents` 数组驱动工作台卡片,直到 `status` 变为 `SUCCESS` 或 `FAILED`。
 
 ### 会话历史接口(可选,第二优先级)
 
