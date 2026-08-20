@@ -7,6 +7,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hmdp.agent.client.DeepSeekClient;
 import com.hmdp.agent.prompt.Prompts;
+import com.hmdp.agent.store.AgentSessionStore;
+import com.hmdp.dto.agent.AgentChatMessage;
 import com.hmdp.dto.agent.AgentChatRequest;
 import com.hmdp.dto.agent.AgentErrorVO;
 import com.hmdp.dto.agent.AgentMessageVO;
@@ -36,6 +38,9 @@ import java.util.stream.Collectors;
 /**
  * Agent业务编排管道类
  * 完整执行链路：LLM意图识别 -> DB商户搜索 -> 预算过滤+排序分析 -> TopN商户推荐 -> LLM汇总生成回复文案
+ * <p>
+ * 多轮会话：会话历史存 Redis(AgentSessionStore)，owner 绑定登录用户；首次 LLM 调用同时完成路由(action)
+ * 与意图识别，action=chat 时直接基于历史回答不搜新商户，action=recommend 时走原 5 步推荐管道。
  * <p>
  * SSE事件与前端约定：
  * session：会话初始化事件，返回sessionId
@@ -70,14 +75,20 @@ public class AgentPipeline {
     @Resource
     private ObjectMapper objectMapper;
 
+    /** Redis 多轮会话存储 */
+    @Resource
+    private AgentSessionStore sessionStore;
 
     /**
-     * Agent主执行入口，完整执行Agent流水线，通过SSE流式推送执行状态和结果给前端
+     * Agent主执行入口。
+     * 先做会话 owner 校验与历史加载，再通过一次 LLM 调用完成路由+意图识别；
+     * action=chat 直接基于历史回答，action=recommend 走原 5 步推荐管道。
      *
      * @param req     用户Agent聊天请求，携带用户输入消息、sessionId
+     * @param userId  当前登录用户id，匿名(未登录)为null，由调用方在线程池提交前解析
      * @param emitter SSE长连接会话对象，用于向前端推送流式事件
      */
-    public void run(AgentChatRequest req, SseEmitter emitter) {
+    public void run(AgentChatRequest req, Long userId, SseEmitter emitter) {
         // 生成会话ID，如果请求未携带则自动生成简短UUID作为sessionId
         String sessionId = StrUtil.isBlank(req.getSessionId())
                 ? "s_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12)
@@ -86,24 +97,55 @@ public class AgentPipeline {
         send(emitter, "session", Collections.singletonMap("sessionId", sessionId));
 
         try {
-            // ==========步骤1：意图识别Agent，调用LLM解析用户需求，提取分类、预算、关键词等信息 ==========
+            // ==========会话归属校验：owner 非空且非当前用户 -> 拒绝；owner 空且已登录 -> 绑定 ==========
+            String owner = sessionStore.loadOwner(sessionId);
+            if (owner != null && !owner.equals(userId == null ? null : String.valueOf(userId))) {
+                send(emitter, "error", new AgentErrorVO("AGENT_SESSION_FORBIDDEN", "会话不属于当前用户"));
+                return;
+            }
+            if (owner == null && userId != null) {
+                sessionStore.bindOwner(sessionId, userId);
+            }
+
+            // 加载多轮历史与上次推荐意图(Redis 故障在此抛出，被外层 catch 转为 error 事件，不会打穿线程池)
+            List<AgentChatMessage> history = sessionStore.loadMessages(sessionId);
+            String lastIntent = sessionStore.loadLastIntent(sessionId);
+
+            // ==========步骤1：理解+路由Agent，一次 LLM 调用输出 action + 意图 ==========
             emitAgent(emitter, 1, "意图识别Agent", "cpu", AgentStatus.RUNNING, "解析用户意图...", null);
             long start = System.currentTimeMillis();
-            // 调用LLM解析用户输入，拿到结构化意图结果
-            Map<String, Object> intent = recognizeIntent(req.getMessage());
-            // 推送意图识别完成状态，附带执行耗时
+            Map<String, Object> intent = understand(history, lastIntent, req.getMessage());
             emitAgent(emitter, 1, "意图识别Agent", "cpu", AgentStatus.DONE, intentDesc(intent), elapsed(start));
 
+            // ==========action=chat：追问分支，直接基于历史回答，不搜新商户 ==========
+            if ("chat".equals(intent.get("action"))) {
+                // 步骤2/3/4 发 DONE"跳过"，保持前端 5 卡不悬挂
+                emitAgent(emitter, 2, "搜索Agent", "search", AgentStatus.DONE, "已跳过(追问)", null);
+                emitAgent(emitter, 3, "分析Agent", "data-line", AgentStatus.DONE, "已跳过(追问)", null);
+                emitAgent(emitter, 4, "推荐Agent", "medal-1", AgentStatus.DONE, "已跳过(追问)", null);
+
+                String markdown = llm.chat(Prompts.chatSystem(), history, req.getMessage());
+                emitAgent(emitter, 5, "汇总Agent", "document-copy", AgentStatus.DONE, "已生成回复", null);
+
+                send(emitter, "message", messageVO(markdown, Collections.emptyList()));
+                send(emitter, "done", Collections.emptyMap());
+                appendTurn(sessionId, req.getMessage(), markdown);
+                return;
+            }
+
+            // ==========action=recommend：走原 5 步推荐管道 ==========
             // ==========步骤2：搜索Agent，根据解析出来的意图从数据库查询候选商户 ==========
             emitAgent(emitter, 2, "搜索Agent", "search", AgentStatus.RUNNING, "检索候选商户...", null);
             start = System.currentTimeMillis();
             List<Shop> shops = searchShops(intent);
             emitAgent(emitter, 2, "搜索Agent", "search", AgentStatus.DONE, "检索到 " + shops.size() + " 家候选商户", elapsed(start));
 
-            // 数据库没有查到任何商户，直接结束流程返回提示
+            // 数据库没有查到任何商户，直接结束流程返回提示（落库兜底，保持多轮上下文完整）
             if (shops.isEmpty()) {
-                send(emitter, "message", messageVO("抱歉，没有找到符合条件的商户。", Collections.emptyList()));
+                String fallback = "抱歉，没有找到符合条件的商户。";
+                send(emitter, "message", messageVO(fallback, Collections.emptyList()));
                 send(emitter, "done", Collections.emptyMap());
+                appendTurn(sessionId, req.getMessage(), fallback);
                 return;
             }
 
@@ -113,10 +155,12 @@ public class AgentPipeline {
             List<Shop> ranked = rankShops(shops, toInt(intent.get("budget")));
             emitAgent(emitter, 3, "分析Agent", "data-line", AgentStatus.DONE, "筛选后 " + ranked.size() + " 家", elapsed(start));
 
-            // 过滤之后没有符合预算条件商户，直接返回提示结束
+            // 过滤之后没有符合预算条件商户，直接返回提示结束（落库兜底）
             if (ranked.isEmpty()) {
-                send(emitter, "message", messageVO("预算范围内没有找到合适的商户。", Collections.emptyList()));
+                String fallback = "预算范围内没有找到合适的商户。";
+                send(emitter, "message", messageVO(fallback, Collections.emptyList()));
                 send(emitter, "done", Collections.emptyMap());
+                appendTurn(sessionId, req.getMessage(), fallback);
                 return;
             }
 
@@ -135,6 +179,9 @@ public class AgentPipeline {
             // 推送最终消息内容、引用来源，推送done事件标志整个Agent流程结束
             send(emitter, "message", messageVO(markdown, buildSources(top)));
             send(emitter, "done", Collections.emptyMap());
+            // 落库本轮对话 + 保存上次推荐意图，供下一轮指代消解
+            appendTurn(sessionId, req.getMessage(), markdown);
+            sessionStore.saveLastIntent(sessionId, intent);
         } catch (Exception e) {
             log.error("agent pipeline error", e);
             // 捕获全部异常，向前端推送SSE error事件，Agent执行异常
@@ -142,19 +189,30 @@ public class AgentPipeline {
         }
     }
 
+    /** 落库一轮 user + assistant 消息。 */
+    private void appendTurn(String sessionId, String userMsg, String assistantMsg) {
+        sessionStore.append(sessionId, "user", userMsg);
+        sessionStore.append(sessionId, "assistant", assistantMsg);
+    }
+
     /**
-     * LLM意图识别：调用大模型JSON模式解析用户输入，提取typeId、typeName、budget、keyword
-     * 并且校验LLM输出的typeId是否真实存在数据库，防止幻觉输出不存在的商户分类ID
+     * LLM 理解+路由：一次调用输出 action(recommend/chat) 与意图(typeId/typeName/budget/keyword)。
+     * 注入上次推荐意图供指代消解（"再便宜一点"基于上次预算增减）；
+     * 校验 LLM 输出的 typeId 是否真实存在数据库，防止幻觉输出不存在的商户分类ID，校验失败降级走关键词搜索。
      *
-     * @param message 用户原始提问
-     * @return 结构化意图Map，包含typeId、typeName、budget、keyword
+     * @param history    多轮对话历史
+     * @param lastIntent 上次推荐意图 JSON 字符串(可为null)
+     * @param message    用户原始提问
+     * @return 结构化意图Map，含 action、typeId、typeName、budget、keyword
      */
-    private Map<String, Object> recognizeIntent(String message) {
+    private Map<String, Object> understand(List<AgentChatMessage> history, String lastIntent, String message) {
         // 查询数据库全部商户分类，用于Prompt构造，同时校验LLM返回typeId合法性
         List<ShopType> types = shopTypeService.query().orderByAsc("sort").list();
         // 调用大模型获取JSON字符串，解析为Map
-        Map<String, Object> parsed = parseJson(llm.chatJson(Prompts.intentSystem(types), "用户需求:" + message));
+        Map<String, Object> parsed = parseJson(llm.chatJson(
+                Prompts.understandSystem(types, lastIntent), history, "用户需求:" + message));
 
+        String action = parsed.get("action") instanceof String ? (String) parsed.get("action") : "recommend";
         Integer typeId = toInt(parsed.get("typeId"));
         String keyword = parsed.get("keyword") instanceof String ? (String) parsed.get("keyword") : null;
 
@@ -167,6 +225,7 @@ public class AgentPipeline {
         }
 
         Map<String, Object> intent = new HashMap<>();
+        intent.put("action", action);
         // typeId合法就存入，不合法置null，后续降级走关键词搜索
         if (matched != null) {
             intent.put("typeId", matched.getId());
@@ -326,7 +385,6 @@ public class AgentPipeline {
         vo.setDuration(duration);
         send(emitter, "agent", vo);
     }
-
 
     /**
      * SSE消息发送通用工具方法

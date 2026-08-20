@@ -19,4 +19,8 @@ public class RedisConstants {
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";
     public static final String USER_SIGN_KEY = "sign:";
+
+    public static final String AGENT_SESSION_KEY = "agent:session:";
+    public static final Long AGENT_SESSION_TTL = 24L;        // 小时
+    public static final int AGENT_SESSION_MAX_MSGS = 20;
 }
